@@ -125,8 +125,8 @@ respond with exactly: FLUSH_OK
                 cwd=str(ROOT),
                 allowed_tools=[],
                 max_turns=2,
-                model="haiku",
-                fallback_model="sonnet",
+                model="sonnet",
+                fallback_model="haiku",
                 stderr=_log_stderr,
                 extra_args={
                     "strict-mcp-config": None,
