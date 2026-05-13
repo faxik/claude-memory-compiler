@@ -358,12 +358,23 @@ respond with exactly: FLUSH_OK
     response = ""
 
     try:
+        def _log_stderr(line: str) -> None:
+            logging.error("[bundled CLI stderr] %s", line.rstrip())
+
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
                 cwd=str(ROOT),
                 allowed_tools=[],
                 max_turns=2,
+                model="sonnet",
+                fallback_model="haiku",
+                stderr=_log_stderr,
+                extra_args={
+                    "strict-mcp-config": None,
+                    "disable-slash-commands": None,
+                    "setting-sources": "user",
+                },
             ),
         ):
             if isinstance(message, AssistantMessage):
