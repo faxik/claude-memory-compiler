@@ -476,6 +476,11 @@ async def run_batch(args: argparse.Namespace) -> None:
 
     # Load state for resume
     batch_state = load_batch_state()
+    if args.reset:
+        n_cleared = len(batch_state.get("processed_sessions", {}))
+        batch_state = {"processed_sessions": {}, "total_cost": 0.0}
+        save_batch_state(batch_state)
+        logging.info("Reset: cleared %d processed_sessions entries from state.json", n_cleared)
     processed = batch_state.get("processed_sessions", {})
 
     if args.resume:
@@ -523,6 +528,7 @@ async def run_batch(args: argparse.Namespace) -> None:
 
     # Process sessions
     all_extractions: list[Extraction] = []
+    already_written_extractions: set[int] = set()  # id()-based dedup for incremental writes
     cumulative_cost = batch_state.get("total_cost", 0.0)
     chunk_num = 0
 
@@ -580,7 +586,23 @@ async def run_batch(args: argparse.Namespace) -> None:
             # Brief pause between API calls
             await asyncio.sleep(0.5)
 
-        # Mark session as processed
+        # Incremental write: flush THIS session's extractions to the daily log
+        # BEFORE recording the session as processed. If we crash between the
+        # write and the state save, --resume will re-process and produce a
+        # duplicate entry (recoverable). If we crash AFTER the state save but
+        # before the write, --resume would mark the session done with nothing
+        # on disk (CATASTROPHIC — this is the bug that ate $60 of quota on
+        # 2026-05-13 when the laptop suspended overnight).
+        session_extractions = [e for e in all_extractions if e.session_id == t.session_id]
+        new_for_this_session = [
+            e for e in session_extractions
+            if id(e) not in already_written_extractions
+        ]
+        if new_for_this_session:
+            write_daily_logs(new_for_this_session)
+            already_written_extractions.update(id(e) for e in new_for_this_session)
+
+        # Mark session as processed (state save AFTER the daily-log write)
         processed[t.session_id] = {
             "chunks": len(chunks),
             "cost": len(chunks) * FLUSH_COST_ESTIMATE,
@@ -590,16 +612,11 @@ async def run_batch(args: argparse.Namespace) -> None:
         batch_state["total_cost"] = cumulative_cost
         save_batch_state(batch_state)
 
-    # Write daily logs
+    # Final summary (daily logs were written incrementally above)
     meaningful = [e for e in all_extractions if "FLUSH_OK" not in e.content and "FLUSH_ERROR" not in e.content]
     logging.info("")
-    logging.info("=== Writing Daily Logs ===")
+    logging.info("=== Run Complete ===")
     logging.info("Total extractions: %d (%d meaningful)", len(all_extractions), len(meaningful))
-
-    written = write_daily_logs(all_extractions)
-    logging.info("Wrote %d daily log files", len(written))
-    for p in written:
-        logging.info("  %s", p.name)
 
     logging.info("")
     logging.info("Total cost: $%.2f", cumulative_cost)
@@ -620,6 +637,15 @@ def main():
     parser.add_argument("--compile", action="store_true", help="Run compile.py after extraction")
     parser.add_argument("--max-cost", type=float, default=None, help="Stop after spending this much ($)")
     parser.add_argument("--resume", action="store_true", help="Skip already-processed sessions")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Clear batch_flush.processed_sessions in state.json before running. "
+            "Use after a buffered-write crash (pre-2026-05-14 bug) where session "
+            "state was saved but daily-log content was never flushed to disk."
+        ),
+    )
     parser.add_argument("--dates", type=str, default=None, help="Comma-separated dates to process (YYYY-MM-DD)")
     parser.add_argument(
         "--transcripts-dir", type=str, default=str(DEFAULT_TRANSCRIPTS_DIR),
