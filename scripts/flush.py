@@ -464,15 +464,20 @@ def main():
         logging.error("Context file not found: %s", context_file)
         return
 
-    # Deduplication: skip if same session was flushed within 60 seconds
-    state = load_flush_state()
-    if (
-        state.get("session_id") == session_id
-        and time.time() - state.get("timestamp", 0) < 60
-    ):
-        logging.info("Skipping duplicate flush for session %s", session_id)
-        context_file.unlink(missing_ok=True)
-        return
+    # Deduplication: skip if same session was flushed within 60 seconds.
+    # BUT: drainer-spawned attempts MUST bypass this gate — otherwise the
+    # drainer's respawn within 60s of a recent SessionEnd would unlink the
+    # inflight context file and exit 0, making the drainer architecturally
+    # broken. (Round-2 adversarial-review SERIOUS-6 → FATAL-tier fix.)
+    if not os.environ.get("FLUSH_FROM_DRAIN"):
+        state = load_flush_state()
+        if (
+            state.get("session_id") == session_id
+            and time.time() - state.get("timestamp", 0) < 60
+        ):
+            logging.info("Skipping duplicate flush for session %s", session_id)
+            context_file.unlink(missing_ok=True)
+            return
 
     # Read pre-extracted context
     context = context_file.read_text(encoding="utf-8").strip()
@@ -483,16 +488,56 @@ def main():
 
     logging.info("Flushing session %s: %d chars", session_id, len(context))
 
-    # Run the LLM extraction
-    response = asyncio.run(run_flush(context))
+    # Run the LLM extraction (with in-process retry loop). On exhaustion,
+    # run_flush raises ParkRequested — caught below.
+    try:
+        response = asyncio.run(run_flush(context))
+    except ParkRequested as park:
+        if os.environ.get("FLUSH_FROM_DRAIN"):
+            # Drainer is driving this attempt; do NOT re-park. Write
+            # FLUSH_ERROR to the daily log + exit 1 so drainer increments
+            # the attempt counter via its failure branch.
+            logging.warning(
+                "FLUSH_FROM_DRAIN set; not re-parking (rule=%s). "
+                "Writing FLUSH_ERROR to daily log.",
+                park.last_rule,
+            )
+            append_to_daily_log(park.flush_error_body, "Memory Flush")
+            save_flush_state({"session_id": session_id, "timestamp": time.time()})
+            # Do NOT unlink the context file — drainer needs it to remain
+            # to know retry is warranted via its own logic. Exit 1.
+            logging.info("Flush exhausted (drain path) for session %s", session_id)
+            sys.exit(1)
 
-    # Append to daily log
+        # Normal path: in-process retry exhausted; park for the drainer.
+        parked_path = park_context_file(
+            context_file=context_file,
+            session_id=session_id,
+            flush_error_response=park.flush_error_body,
+            last_rule=park.last_rule,
+        )
+        logging.warning(
+            "PARKED context file -> %s (rule=%s)",
+            parked_path, park.last_rule,
+        )
+        save_flush_state({"session_id": session_id, "timestamp": time.time()})
+        # Do NOT write FLUSH_ERROR to the daily log on park — drainer's
+        # eventual retry either succeeds (real content lands) or hits
+        # dead-letter (operator inspects sidecar).
+        logging.info(
+            "Flush parked for session %s; drainer will retry",
+            session_id,
+        )
+        return
+
+    # Append to daily log (non-park path)
     if "FLUSH_OK" in response:
         logging.info("Result: FLUSH_OK")
         append_to_daily_log(
             "FLUSH_OK - Nothing worth saving from this session", "Memory Flush"
         )
     elif "FLUSH_ERROR" in response:
+        # fail_fast verdict reached without park.
         logging.error("Result: %s", response)
         append_to_daily_log(response, "Memory Flush")
     else:
@@ -502,7 +547,7 @@ def main():
     # Update dedup state
     save_flush_state({"session_id": session_id, "timestamp": time.time()})
 
-    # Clean up context file
+    # Clean up context file (success path only — parked files were moved)
     context_file.unlink(missing_ok=True)
 
     # End-of-day auto-compilation: if it's past the compile hour and today's
