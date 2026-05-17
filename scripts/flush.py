@@ -20,6 +20,7 @@ import json
 import logging
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,6 +72,57 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
         f.write(entry)
 
 
+def _build_flush_error_response(
+    exc: BaseException,
+    stderr_tail: "deque[str] | None" = None,
+    *,
+    attempts: int = 1,
+) -> str:
+    """Build a diagnostic-rich FLUSH_ERROR line for the daily log.
+
+    Captured signals (all best-effort — missing fields are omitted, not
+    rendered as 'None'):
+      - exc class name (e.g., ProcessError, Exception)
+      - first 300 chars of str(exc) ("message:")
+      - exc.exit_code if a ProcessError attribute is present
+      - exc.stderr if present (note: SDK hardcodes this to boilerplate;
+        we record it anyway because Slice 2 may need it)
+      - stderr_tail (last 50 lines from the options.stderr callback)
+      - attempts field (=1 for Slice 1; Slice 2 wires real retry attempts)
+
+    Format is line-oriented + greppable. The first line still starts with
+    'FLUSH_ERROR:' so existing dispatch logic at the bottom of main() still
+    works.
+    """
+    parts: list[str] = []
+    parts.append(f"FLUSH_ERROR: {type(exc).__name__}")
+
+    exit_code = getattr(exc, "exit_code", None)
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+    parts.append(f"attempts={attempts}")
+
+    header = " | ".join(parts)
+    body: list[str] = [header]
+
+    msg = str(exc)[:300]
+    if msg.strip():
+        body.append(f"  message: {msg}")
+
+    sdk_stderr = getattr(exc, "stderr", None)
+    if sdk_stderr:
+        # Known boilerplate from claude_agent_sdk subprocess_cli is
+        # "Check stderr output for details" — record anyway, harmless.
+        body.append(f"  sdk_stderr: {str(sdk_stderr)[:200]}")
+
+    if stderr_tail:
+        body.append("  stderr_tail:")
+        for line in stderr_tail:
+            body.append(f"    {line}")
+
+    return "\n".join(body)
+
+
 async def run_flush(context: str) -> str:
     """Use Claude Agent SDK to extract important knowledge from conversation context."""
     from claude_agent_sdk import (
@@ -115,9 +167,18 @@ respond with exactly: FLUSH_OK
 
     response = ""
 
+    # Bounded stderr capture for FLUSH_ERROR diagnostics.
+    # The bundled CLI's real stderr arrives via this callback (NOT via the
+    # exc.stderr attribute — that one is hardcoded boilerplate by the SDK).
+    # Keep the last 50 lines; enough to catch rate-limit text without
+    # bloating the daily log.
+    stderr_tail: deque[str] = deque(maxlen=50)
+
     try:
         def _log_stderr(line: str) -> None:
-            logging.error("[bundled CLI stderr] %s", line.rstrip())
+            stripped = line.rstrip()
+            logging.error("[bundled CLI stderr] %s", stripped)
+            stderr_tail.append(stripped)
 
         async for message in query(
             prompt=prompt,
@@ -144,7 +205,7 @@ respond with exactly: FLUSH_OK
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
-        response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
+        response = _build_flush_error_response(e, stderr_tail, attempts=1)
 
     return response
 
