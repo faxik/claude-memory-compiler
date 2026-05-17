@@ -54,9 +54,32 @@ def save_flush_state(state: dict) -> None:
 
 
 def append_to_daily_log(content: str, section: str = "Session") -> None:
-    """Append content to today's daily log."""
+    """Append content to today's daily log.
+
+    Content-hash dedup gate: if this exact content body has been appended
+    in the last 24h, skip silently and log "DUP_SKIP". Solves
+    duplicate-on-retry-replay for the common "client crashed mid-write"
+    case. (LLM non-determinism on regenerated content can defeat this
+    gate; input-hash variant is in followups.)
+
+    When invoked from the drainer (FLUSH_ORIGINAL_MTIME env set), the
+    section header carries the original-session timestamp + the drain
+    timestamp so the daily log doesn't pretend old work is fresh.
+    """
+    from dedup import record_append, should_append
+
     today = datetime.now(timezone.utc).astimezone()
     log_path = DAILY_DIR / f"{today.strftime('%Y-%m-%d')}.md"
+    ledger_path = SCRIPTS_DIR / "appended_hashes.json"
+
+    # Dedup gate. Hash the content body only; the header (with timestamps)
+    # would defeat dedup since timestamps differ on retries.
+    if not should_append(content, ledger_path):
+        logging.info(
+            "DUP_SKIP: content hash already appended in last 24h (section=%s)",
+            section,
+        )
+        return
 
     if not log_path.exists():
         DAILY_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,10 +89,33 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
         )
 
     time_str = today.strftime("%H:%M")
-    entry = f"### {section} ({time_str})\n\n{content}\n\n"
+
+    # Chronology header: when drainer-driven, mark the original session
+    # time alongside the drain time. Catches ValueError, OSError,
+    # OverflowError (datetime.fromtimestamp(inf) raises OverflowError),
+    # and TypeError (None propagation).
+    original_mtime_env = os.environ.get("FLUSH_ORIGINAL_MTIME")
+    if original_mtime_env:
+        try:
+            orig_dt = datetime.fromtimestamp(
+                float(original_mtime_env), timezone.utc
+            ).astimezone()
+            header = (
+                f"### {section} "
+                f"(originally {orig_dt.strftime('%H:%M %Y-%m-%d')}, "
+                f"drained {time_str})"
+            )
+        except (ValueError, OSError, OverflowError, TypeError):
+            header = f"### {section} ({time_str})"
+    else:
+        header = f"### {section} ({time_str})"
+
+    entry = f"{header}\n\n{content}\n\n"
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(entry)
+
+    record_append(content, ledger_path)
 
 
 def _build_flush_error_response(

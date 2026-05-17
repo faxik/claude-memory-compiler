@@ -88,6 +88,90 @@ class TestDedup(unittest.TestCase):
         self.assertTrue(result)
         self.assertFalse(self.ledger.exists())
 
+    def test_append_to_daily_log_dedup_gate_blocks_duplicate(self):
+        """End-to-end: flush.append_to_daily_log skips on duplicate content."""
+        import os
+        import flush  # patch its module-level paths to point at tmpdir
+        original_daily = flush.DAILY_DIR
+        original_scripts = flush.SCRIPTS_DIR
+        try:
+            flush.DAILY_DIR = Path(self.tmpdir) / "daily"
+            flush.SCRIPTS_DIR = Path(self.tmpdir) / "scripts"
+            flush.DAILY_DIR.mkdir(parents=True)
+            flush.SCRIPTS_DIR.mkdir(parents=True)
+
+            flush.append_to_daily_log("test content", "Session")
+            flush.append_to_daily_log("test content", "Session")  # dup
+            today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+            log = flush.DAILY_DIR / f"{today}.md"
+            text = log.read_text(encoding="utf-8")
+            self.assertEqual(text.count("test content"), 1)
+        finally:
+            flush.DAILY_DIR = original_daily
+            flush.SCRIPTS_DIR = original_scripts
+
+    def test_append_to_daily_log_survives_corrupt_original_mtime(self):
+        """M-4 fix: FLUSH_ORIGINAL_MTIME=inf must NOT crash the append.
+        datetime.fromtimestamp(inf) raises OverflowError; our except
+        catches it and falls back to the plain header."""
+        import os
+        import flush
+        original_daily = flush.DAILY_DIR
+        original_scripts = flush.SCRIPTS_DIR
+        original_env = os.environ.get("FLUSH_ORIGINAL_MTIME")
+        try:
+            flush.DAILY_DIR = Path(self.tmpdir) / "daily"
+            flush.SCRIPTS_DIR = Path(self.tmpdir) / "scripts"
+            flush.DAILY_DIR.mkdir(parents=True)
+            flush.SCRIPTS_DIR.mkdir(parents=True)
+            os.environ["FLUSH_ORIGINAL_MTIME"] = "inf"
+
+            # Must NOT raise.
+            flush.append_to_daily_log("corrupt-mtime probe", "Memory Flush")
+            today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+            log = flush.DAILY_DIR / f"{today}.md"
+            text = log.read_text(encoding="utf-8")
+            self.assertIn("corrupt-mtime probe", text)
+            # Plain header (no "originally" annotation).
+            self.assertNotIn("originally", text)
+        finally:
+            flush.DAILY_DIR = original_daily
+            flush.SCRIPTS_DIR = original_scripts
+            if original_env is None:
+                os.environ.pop("FLUSH_ORIGINAL_MTIME", None)
+            else:
+                os.environ["FLUSH_ORIGINAL_MTIME"] = original_env
+
+    def test_append_to_daily_log_renders_chronology_header_when_mtime_set(self):
+        """When FLUSH_ORIGINAL_MTIME is a valid timestamp, the section
+        header carries the original time alongside the drain time."""
+        import os, time
+        import flush
+        original_daily = flush.DAILY_DIR
+        original_scripts = flush.SCRIPTS_DIR
+        original_env = os.environ.get("FLUSH_ORIGINAL_MTIME")
+        try:
+            flush.DAILY_DIR = Path(self.tmpdir) / "daily"
+            flush.SCRIPTS_DIR = Path(self.tmpdir) / "scripts"
+            flush.DAILY_DIR.mkdir(parents=True)
+            flush.SCRIPTS_DIR.mkdir(parents=True)
+            # 2 hours ago
+            os.environ["FLUSH_ORIGINAL_MTIME"] = str(time.time() - 7200)
+
+            flush.append_to_daily_log("drained content probe", "Memory Flush")
+            today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+            log = flush.DAILY_DIR / f"{today}.md"
+            text = log.read_text(encoding="utf-8")
+            self.assertIn("originally", text)
+            self.assertIn("drained", text)
+        finally:
+            flush.DAILY_DIR = original_daily
+            flush.SCRIPTS_DIR = original_scripts
+            if original_env is None:
+                os.environ.pop("FLUSH_ORIGINAL_MTIME", None)
+            else:
+                os.environ["FLUSH_ORIGINAL_MTIME"] = original_env
+
     def test_concurrent_record_append_preserves_all_entries(self):
         """SERIOUS-4 fix: fcntl.flock around read-modify-write must
         prevent lost entries when multiple writers race."""
