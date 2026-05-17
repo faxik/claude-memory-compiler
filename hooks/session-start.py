@@ -85,6 +85,32 @@ def main():
         }
     }
 
+    # Fire-and-forget drainer spawn. SessionStart hook has a 15s
+    # timeout per .claude/settings.json; we MUST return in <50ms.
+    # Popen with stdout/stderr=DEVNULL and a detached process group
+    # keeps us well under budget. Failures here are non-fatal —
+    # drain.py's own log (drain.log) captures any drainer-side issues.
+    try:
+        import subprocess
+        drain_script = ROOT / "scripts" / "drain.py"
+        if drain_script.exists():
+            cmd = [
+                "uv", "run", "--directory", str(ROOT),
+                "python", str(drain_script), "--max", "1",
+            ]
+            kwargs: dict = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            else:
+                kwargs["start_new_session"] = True
+            subprocess.Popen(cmd, **kwargs)
+    except Exception:
+        # Drainer spawn failures must not block SessionStart.
+        pass
+
     print(json.dumps(output))
 
 
