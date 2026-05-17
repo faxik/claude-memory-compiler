@@ -131,10 +131,14 @@ def _build_flush_error_response(
       - exc class name (e.g., ProcessError, Exception)
       - first 300 chars of str(exc) ("message:")
       - exc.exit_code if a ProcessError attribute is present
-      - exc.stderr if present (note: SDK hardcodes this to boilerplate;
-        we record it anyway because Slice 2 may need it)
-      - stderr_tail (last 50 lines from the options.stderr callback)
-      - attempts field (=1 for Slice 1; Slice 2 wires real retry attempts)
+      - exc.stderr if present (SDK hardcodes this to the boilerplate
+        string "Check stderr output for details"; we record it only as
+        a forensic crumb. Slice 2's classifier deliberately ignores
+        this attribute — see scripts/classifier.py and
+        tools/lint_classifier.py.)
+      - stderr_tail (last 50 lines from the options.stderr callback —
+        the ONLY source of real bundled-CLI stderr text)
+      - attempts field (real attempt count from run_flush's retry loop)
 
     Format is line-oriented + greppable. The first line still starts with
     'FLUSH_ERROR:' so existing dispatch logic at the bottom of main() still
@@ -169,8 +173,101 @@ def _build_flush_error_response(
     return "\n".join(body)
 
 
+class ParkRequested(Exception):
+    """Raised by run_flush when in-process retry exhausted on a transient
+    pattern, signalling that main() should park the context file for the
+    drainer rather than write FLUSH_ERROR.
+
+    Why an exception instead of a string sentinel: an LLM could
+    legitimately emit "PARK_REQUESTED" as the first token of a response
+    (especially in sessions that discuss this codebase), causing a
+    false-positive park + silent data loss. Exception-based signalling
+    avoids the collision.
+    """
+
+    def __init__(self, flush_error_body: str, last_rule: str = "unknown"):
+        super().__init__(flush_error_body)
+        self.flush_error_body = flush_error_body
+        self.last_rule = last_rule
+
+
+def park_context_file(
+    context_file: Path,
+    session_id: str,
+    flush_error_response: str,
+    last_rule: str = "unknown",
+) -> Path:
+    """Move a failed context file to scripts/parked/ with a sidecar.
+
+    The sidecar JSON tracks attempt count + first/last-attempt timestamps
+    so the drainer can promote to dead-letter after N tries.
+
+    Returns the parked path (the .md file's new location).
+    """
+    parked_dir = SCRIPTS_DIR / "parked"
+    parked_dir.mkdir(parents=True, exist_ok=True)
+
+    parked_md = parked_dir / f"session-flush-{session_id}.md"
+    parked_sidecar = parked_dir / f"session-flush-{session_id}.json"
+
+    # Move the context file (atomic on same-filesystem). On EXDEV
+    # (cross-filesystem) or other rename failure, we return the original
+    # path and the file remains at its source location — the drainer's
+    # legacy-orphan glob (session-flush-*.md in scripts/) will pick it
+    # up on the next SessionStart, so it's not silently lost.
+    try:
+        os.replace(str(context_file), str(parked_md))
+    except OSError as e:
+        logging.warning(
+            "park_context_file: rename %s -> %s failed: %s. File remains at "
+            "original location; drainer will adopt via legacy-orphan glob.",
+            context_file, parked_md, e,
+        )
+        return context_file
+
+    # Read existing sidecar if drainer is re-parking; otherwise create.
+    now_iso = datetime.now(timezone.utc).astimezone().isoformat()
+    sidecar_data: dict = {
+        "session_id": session_id,
+        "first_attempt_at": now_iso,
+        "last_attempt_at": now_iso,
+        "attempts": 1,
+        "last_rule": last_rule,
+        "last_error": flush_error_response[:1000],
+    }
+    if parked_sidecar.exists():
+        try:
+            existing = json.loads(parked_sidecar.read_text(encoding="utf-8"))
+            sidecar_data["first_attempt_at"] = existing.get(
+                "first_attempt_at", now_iso
+            )
+            sidecar_data["attempts"] = existing.get("attempts", 0) + 1
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    parked_sidecar.write_text(
+        json.dumps(sidecar_data, indent=2), encoding="utf-8"
+    )
+    return parked_md
+
+
 async def run_flush(context: str) -> str:
-    """Use Claude Agent SDK to extract important knowledge from conversation context."""
+    """Use Claude Agent SDK to extract knowledge from conversation context.
+
+    Wraps the SDK query() in an in-process retry loop driven by classify().
+    - On verdict="retry" (transient): sleep 2s/4s; retry up to 2 times.
+    - On rate_limit_signal rule_name: sleep 60s once then retry.
+    - On verdict="fail_fast" (auth/400/local-IO): skip retry, return
+      FLUSH_ERROR immediately.
+
+    Returns either the LLM extraction text, "FLUSH_OK", or a
+    FLUSH_ERROR-prefixed diagnostic on fail_fast.
+
+    Raises ParkRequested when in-process budget is exhausted on a
+    transient pattern — caller (main()) parks the context file for
+    the drainer to retry. Exception-based signal (not a string sentinel)
+    avoids the LLM-output-collision footgun.
+    """
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -178,6 +275,7 @@ async def run_flush(context: str) -> str:
         TextBlock,
         query,
     )
+    from classifier import classify
 
     prompt = f"""Review the conversation context below and respond with a concise summary
 of important items that should be preserved in the daily log.
@@ -211,21 +309,19 @@ respond with exactly: FLUSH_OK
 
 {context}"""
 
-    response = ""
-
-    # Bounded stderr capture for FLUSH_ERROR diagnostics.
-    # The bundled CLI's real stderr arrives via this callback (NOT via the
-    # exc.stderr attribute — that one is hardcoded boilerplate by the SDK).
-    # Keep the last 50 lines; enough to catch rate-limit text without
-    # bloating the daily log.
+    # Bounded stderr capture for FLUSH_ERROR diagnostics + rate-limit
+    # signal detection. The bundled CLI's real stderr arrives via this
+    # callback (NOT via exc.stderr — hardcoded boilerplate). Keep last
+    # 50 lines; enough to catch rate-limit text without bloating logs.
     stderr_tail: deque[str] = deque(maxlen=50)
 
-    try:
-        def _log_stderr(line: str) -> None:
-            stripped = line.rstrip()
-            logging.error("[bundled CLI stderr] %s", stripped)
-            stderr_tail.append(stripped)
+    def _log_stderr(line: str) -> None:
+        stripped = line.rstrip()
+        logging.error("[bundled CLI stderr] %s", stripped)
+        stderr_tail.append(stripped)
 
+    async def _single_attempt() -> str:
+        collected = ""
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
@@ -245,15 +341,63 @@ respond with exactly: FLUSH_OK
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        response += block.text
+                        collected += block.text
             elif isinstance(message, ResultMessage):
                 pass
-    except Exception as e:
-        import traceback
-        logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
-        response = _build_flush_error_response(e, stderr_tail, attempts=1)
+        return collected
 
-    return response
+    # In-process retry budget. attempts 1..MAX_ATTEMPTS.
+    MAX_ATTEMPTS = 3  # 1 initial + 2 retries
+    BACKOFF_SCHEDULE_S = (2.0, 4.0)  # waits BEFORE attempts 2 and 3
+    RATE_LIMIT_SLEEP_S = 60.0  # one-shot longer wait for rate_limit verdict
+    last_exception: BaseException | None = None
+    last_verdict_rule: str = "no_attempt"
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            result = await _single_attempt()
+            return result  # success
+        except Exception as e:
+            last_exception = e
+            verdict = classify(e, stderr_tail=list(stderr_tail))
+            last_verdict_rule = verdict.rule_name
+            logging.warning(
+                "run_flush attempt %d/%d failed: %s (verdict=%s, rule=%s)",
+                attempt, MAX_ATTEMPTS, type(e).__name__,
+                verdict.kind, verdict.rule_name,
+            )
+
+            if verdict.kind == "fail_fast":
+                import traceback
+                logging.error(
+                    "Agent SDK error (fail_fast): %s\n%s",
+                    e, traceback.format_exc(),
+                )
+                return _build_flush_error_response(e, stderr_tail, attempts=attempt)
+
+            if attempt == MAX_ATTEMPTS:
+                logging.warning(
+                    "run_flush in-process budget exhausted after %d attempts "
+                    "(last rule: %s); raising ParkRequested",
+                    attempt, verdict.rule_name,
+                )
+                body = _build_flush_error_response(e, stderr_tail, attempts=attempt)
+                raise ParkRequested(body, last_rule=last_verdict_rule) from e
+
+            # Verdict is retry; we have budget left.
+            if verdict.rule_name == "rate_limit_signal":
+                sleep_for = RATE_LIMIT_SLEEP_S
+            else:
+                sleep_for = BACKOFF_SCHEDULE_S[attempt - 1]
+            logging.info(
+                "run_flush sleeping %.1fs before attempt %d",
+                sleep_for, attempt + 1,
+            )
+            await asyncio.sleep(sleep_for)
+
+    # Defensive fallback — loop should always return or raise.
+    assert last_exception is not None
+    return _build_flush_error_response(last_exception, stderr_tail, attempts=MAX_ATTEMPTS)
 
 
 COMPILE_AFTER_HOUR = 18  # 6 PM local time
