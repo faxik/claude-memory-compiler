@@ -142,6 +142,47 @@ class TestDedup(unittest.TestCase):
             else:
                 os.environ["FLUSH_ORIGINAL_MTIME"] = original_env
 
+    def test_chronology_header_uses_original_section(self):
+        """T0.B: when FLUSH_ORIGINAL_SECTION is set, the drained-entry
+        header uses it instead of the drain-time `section` parameter.
+        A "Session" originally that failed and got replayed should
+        appear as "Session (originally..., drained...)", not "Memory Flush".
+        """
+        import os, time
+        import flush
+        original_daily = flush.DAILY_DIR
+        original_scripts = flush.SCRIPTS_DIR
+        original_mtime_env = os.environ.get("FLUSH_ORIGINAL_MTIME")
+        original_section_env = os.environ.get("FLUSH_ORIGINAL_SECTION")
+        try:
+            flush.DAILY_DIR = Path(self.tmpdir) / "daily"
+            flush.SCRIPTS_DIR = Path(self.tmpdir) / "scripts"
+            flush.DAILY_DIR.mkdir(parents=True)
+            flush.SCRIPTS_DIR.mkdir(parents=True)
+            os.environ["FLUSH_ORIGINAL_MTIME"] = str(time.time() - 7200)
+            os.environ["FLUSH_ORIGINAL_SECTION"] = "Session"
+
+            # Caller (drainer-spawned flush.py) passes section="Memory Flush"
+            # because it's writing a FLUSH_ERROR — but the env says the
+            # ORIGINAL section was "Session". Original wins.
+            flush.append_to_daily_log("chronology section probe", "Memory Flush")
+            today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+            log = flush.DAILY_DIR / f"{today}.md"
+            text = log.read_text(encoding="utf-8")
+            self.assertIn("### Session (originally", text)
+            self.assertNotIn("### Memory Flush (originally", text)
+        finally:
+            flush.DAILY_DIR = original_daily
+            flush.SCRIPTS_DIR = original_scripts
+            for var, original in (
+                ("FLUSH_ORIGINAL_MTIME", original_mtime_env),
+                ("FLUSH_ORIGINAL_SECTION", original_section_env),
+            ):
+                if original is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = original
+
     def test_append_to_daily_log_renders_chronology_header_when_mtime_set(self):
         """When FLUSH_ORIGINAL_MTIME is a valid timestamp, the section
         header carries the original time alongside the drain time."""

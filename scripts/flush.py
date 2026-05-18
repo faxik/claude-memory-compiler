@@ -105,9 +105,14 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
     time_str = today.strftime("%H:%M")
 
     # Chronology header: when drainer-driven, mark the original session
-    # time alongside the drain time. Catches ValueError, OSError,
-    # OverflowError (datetime.fromtimestamp(inf) raises OverflowError),
-    # and TypeError (None propagation).
+    # time alongside the drain time. The section name itself can also
+    # be preserved from the original (via FLUSH_ORIGINAL_SECTION env),
+    # so a drained "Session" doesn't get rewritten as "Memory Flush"
+    # just because it failed and got retried.
+    #
+    # Catches ValueError, OSError, OverflowError (datetime.fromtimestamp(inf)
+    # raises OverflowError), and TypeError (None propagation).
+    original_section = os.environ.get("FLUSH_ORIGINAL_SECTION") or section
     original_mtime_env = os.environ.get("FLUSH_ORIGINAL_MTIME")
     if original_mtime_env:
         try:
@@ -115,7 +120,7 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
                 float(original_mtime_env), timezone.utc
             ).astimezone()
             header = (
-                f"### {section} "
+                f"### {original_section} "
                 f"(originally {orig_dt.strftime('%H:%M %Y-%m-%d')}, "
                 f"drained {time_str})"
             )

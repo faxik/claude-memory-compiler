@@ -337,6 +337,13 @@ def drain_one(
         env["FLUSH_ORIGINAL_MTIME"] = str(original_mtime)
     except OSError:
         pass
+    # Pass the SECTION name flush.py used originally (if we have it from
+    # the sidecar), so the chronology header preserves it. Defaults to
+    # "Memory Flush" if absent — the drainer's typical case is replaying
+    # a failure, so the original section IS Memory Flush.
+    env["FLUSH_ORIGINAL_SECTION"] = sidecar_data.get(
+        "original_section", "Memory Flush"
+    )
     cmd = [
         "uv", "run", "--directory", str(project_root),
         "python", str(flush_script),
