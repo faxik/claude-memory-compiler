@@ -16,6 +16,18 @@ if str(SCRIPTS) not in sys.path:
 from dedup import record_append, should_append  # noqa: E402
 
 
+def _cross_process_worker(ledger_path_str: str, proc_idx: int) -> None:
+    """Module-level so multiprocessing-spawn can pickle it.
+    Used by TestDedup.test_concurrent_record_append_across_processes (T0.F).
+    """
+    import sys
+    from pathlib import Path as _Path
+    sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    from dedup import record_append as _ra
+    for i in range(4):
+        _ra(f"proc-{proc_idx}-content-{i}", _Path(ledger_path_str))
+
+
 class TestDedup(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -215,7 +227,7 @@ class TestDedup(unittest.TestCase):
 
     def test_concurrent_record_append_preserves_all_entries(self):
         """SERIOUS-4 fix: fcntl.flock around read-modify-write must
-        prevent lost entries when multiple writers race."""
+        prevent lost entries when multiple writers race (thread-level)."""
         import threading
         contents = [f"content-{i}" for i in range(20)]
 
@@ -230,6 +242,39 @@ class TestDedup(unittest.TestCase):
 
         data = json.loads(self.ledger.read_text(encoding="utf-8"))
         self.assertEqual(len(data), 20)
+
+    def test_concurrent_record_append_across_processes(self):
+        """T0.F: cross-process fcntl.flock contract. Spawn 5 subprocesses
+        each calling record_append 4 times (= 20 unique entries total);
+        assert the ledger has all 20 entries. fcntl.flock acts on the
+        kernel inode, not on Python objects, so this works across procs.
+
+        Tests the SAME invariant as the in-process thread test but at
+        the OS level — round-3 adversarial review (W-2) flagged that
+        thread tests don't prove cross-process behavior since Python's
+        GIL serializes thread-level access regardless of the lock."""
+        import multiprocessing
+
+        # Use spawn context for portability. _cross_process_worker is
+        # defined at module scope so spawn can pickle it.
+        ctx = multiprocessing.get_context("spawn")
+        procs = [
+            ctx.Process(target=_cross_process_worker, args=(str(self.ledger), idx))
+            for idx in range(5)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+            self.assertEqual(p.exitcode, 0, f"worker died: exit={p.exitcode}")
+
+        # Without fcntl.flock at the OS level, races would lose entries
+        # in this 5×4 sequence. With the lock, all 20 land.
+        data = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.assertEqual(
+            len(data), 20,
+            f"expected 20 entries, got {len(data)} — cross-process race lost entries",
+        )
 
 
 if __name__ == "__main__":
