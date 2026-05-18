@@ -36,12 +36,22 @@ DEAD_LETTER_DIR = SCRIPTS_DIR / "dead-letter"
 FLUSH_SCRIPT = SCRIPTS_DIR / "flush.py"
 LOG_FILE = SCRIPTS_DIR / "drain.log"
 
-logging.basicConfig(
+# RotatingFileHandler with 5MB cap × 3 backups (see flush.py for rationale).
+from logging.handlers import RotatingFileHandler
+
+_handler = RotatingFileHandler(
     filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [drain] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    maxBytes=5_000_000,
+    backupCount=3,
+    encoding="utf-8",
 )
+_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [drain] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+)
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 
 MAX_ATTEMPTS = 5
 DRAIN_DEFAULT_LIMIT = 1

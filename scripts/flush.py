@@ -32,12 +32,26 @@ LOG_FILE = SCRIPTS_DIR / "flush.log"
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
 # file handle bug on Windows), so this is our only observability channel.
-logging.basicConfig(
+#
+# RotatingFileHandler with 5MB cap × 3 backups (so flush.log + .1 + .2 + .3
+# = ~20MB ceiling). At ~100B/line, that's ~50K lines/file × 4 files = 200K
+# lines retained, with newest entries always in flush.log. Replaces the
+# unbounded basicConfig path which had accumulated 28K+ lines pre-rotation.
+from logging.handlers import RotatingFileHandler
+
+_handler = RotatingFileHandler(
     filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    maxBytes=5_000_000,
+    backupCount=3,
+    encoding="utf-8",
 )
+_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+)
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 
 
 def load_flush_state() -> dict:
