@@ -57,6 +57,9 @@ CLASSIFICATIONS: tuple[_Rule, ...] = (
         exit_code=None,
         verdict_kind="fail_fast",
     ),
+    # UNVERIFIED — speculative
+    # Belt-and-suspenders message-pattern path; SDK literal "Claude Code
+    # not found" not yet observed in this codebase's flush.log.
     _Rule(
         name="cli_not_found_by_message",
         exc_class_name=None,
@@ -93,6 +96,7 @@ CLASSIFICATIONS: tuple[_Rule, ...] = (
         exit_code=None,
         verdict_kind="fail_fast",
     ),
+    # UNVERIFIED — speculative
     # Permanent — auth failure. Not yet observed in this codebase's
     # flush.log; pattern seeded from Anthropic API conventions. Refine
     # after Slice 1 evidence accumulates (see "Deploy Prerequisites").
@@ -105,6 +109,7 @@ CLASSIFICATIONS: tuple[_Rule, ...] = (
         exit_code=None,
         verdict_kind="fail_fast",
     ),
+    # UNVERIFIED — speculative
     # Permanent — request too large. Same caveat as auth_invalid.
     _Rule(
         name="prompt_too_long",
@@ -115,10 +120,12 @@ CLASSIFICATIONS: tuple[_Rule, ...] = (
         exit_code=None,
         verdict_kind="fail_fast",
     ),
+    # UNVERIFIED — speculative
     # Rate-limit signal — must be matched against the REAL stderr_tail
     # text (the SDK's exception stderr attribute is hardcoded boilerplate;
     # see classify() docstring). Stays "retry" verdict but the rule_name
-    # carries the signal so the caller can pick a longer backoff.
+    # carries the signal so the caller can pick a longer backoff. Real
+    # rate-limit signatures haven't been captured in flush.log yet.
     _Rule(
         name="rate_limit_signal",
         exc_class_name=None,
