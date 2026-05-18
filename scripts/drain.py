@@ -57,6 +57,44 @@ MAX_ATTEMPTS = 5
 DRAIN_DEFAULT_LIMIT = 1
 MAX_AGE_DAYS = 14
 MAX_RACE_LOSSES = 3
+# Default daily retry-cost cap in USD. ≥2 historical-mean retries
+# (mean compile $4.48 per scripts/state.json). Overridable per-day
+# via state.json key `daily_retry_cost_cap`.
+DEFAULT_DAILY_COST_CAP_USD = 15.0
+STATE_FILE = SCRIPTS_DIR / "state.json"
+
+
+def _today_iso() -> str:
+    """Local-tz date in ISO YYYY-MM-DD form (matches existing state.json layout)."""
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+
+
+def _load_daily_retry_cost(state_file: Path | None = None) -> tuple[float, float]:
+    """Return (spent_today_usd, cap_usd) from state.json.
+
+    cap_usd reads `daily_retry_cost_cap` if present, else
+    DEFAULT_DAILY_COST_CAP_USD. spent_today_usd reads
+    `daily_retry_cost[<today>]` (defaults to 0.0). Missing state file
+    or malformed JSON treated as $0 spent + default cap.
+
+    state_file: if None, looks up module-level STATE_FILE at call time.
+    This indirection lets tests patch `drain.STATE_FILE` and have the
+    change picked up — Python's default-argument-at-def-time semantics
+    would otherwise pin the original module-level path forever.
+    """
+    if state_file is None:
+        state_file = STATE_FILE
+    if not state_file.exists():
+        return 0.0, DEFAULT_DAILY_COST_CAP_USD
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return 0.0, DEFAULT_DAILY_COST_CAP_USD
+    cap = float(data.get("daily_retry_cost_cap", DEFAULT_DAILY_COST_CAP_USD))
+    today = _today_iso()
+    daily = data.get("daily_retry_cost", {})
+    spent = float(daily.get(today, 0.0))
+    return spent, cap
 
 
 def _sidecar_for(md_or_inflight: Path) -> Path:
@@ -325,6 +363,21 @@ def drain_one(
             dead_letter_dir=dead_letter_dir,
         )
         return 1
+
+    # Cost-budget circuit breaker (T0.D).
+    # If today's accumulated retry cost from state.json's daily_retry_cost
+    # dict exceeds the cap (default $15, overridable via daily_retry_cost_cap),
+    # SKIP the dispatch — log BUDGET_EXCEEDED, release the inflight back to
+    # .md so a future drainer day picks it up, return 0.
+    spent_today, cap = _load_daily_retry_cost()
+    if spent_today >= cap:
+        logging.warning(
+            "BUDGET_EXCEEDED: daily_retry_cost[%s] = $%.4f >= cap $%.4f; "
+            "skipping drain of session %s, releasing inflight",
+            _today_iso(), spent_today, cap, session_id,
+        )
+        release(inflight)
+        return 0
 
     # Spawn flush.py against the inflight file.
     env = dict(os.environ)

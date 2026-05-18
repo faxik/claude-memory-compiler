@@ -324,6 +324,39 @@ class TestDrainerEndToEnd(unittest.TestCase):
         )
         self.assertEqual(result, 0)
 
+    def test_drain_skips_when_budget_exceeded(self):
+        """T0.D: when state.json's daily_retry_cost[today] exceeds cap,
+        drain_one SKIPS the dispatch (does not call subprocess.run),
+        releases the inflight, returns 0, and logs BUDGET_EXCEEDED."""
+        # Set up a parked candidate.
+        self._make_parked("budgetbusted", attempts=1)
+        # Synthesize a state.json with daily_retry_cost above the cap.
+        today = drain._today_iso()
+        state_file = self.tmpdir / "state.json"
+        state_file.write_text(json.dumps({
+            "daily_retry_cost": {today: 20.0},  # above default cap $15
+            "ingested": {},
+        }))
+        # Patch drain.STATE_FILE to point at the tmp state.json.
+        original_state_file = drain.STATE_FILE
+        drain.STATE_FILE = state_file
+        try:
+            with mock.patch("drain.subprocess.run") as run:
+                result = drain.drain_one(
+                    parked_dir=self.parked,
+                    scripts_dir=self.tmpdir,
+                    dead_letter_dir=self.dead_letter,
+                    flush_script=Path("/fake/flush.py"),
+                    project_root=self.tmpdir,
+                )
+                # subprocess.run MUST NOT have been called — budget gate fired
+                run.assert_not_called()
+            self.assertEqual(result, 0)
+            # Inflight file released back to .md
+            self.assertTrue((self.parked / "session-flush-budgetbusted.md").exists())
+        finally:
+            drain.STATE_FILE = original_state_file
+
 
 if __name__ == "__main__":
     unittest.main()

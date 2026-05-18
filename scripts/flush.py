@@ -67,6 +67,29 @@ def save_flush_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
+def _record_daily_retry_cost(cost_usd: float) -> None:
+    """T0.D: increment state.json's daily_retry_cost[<today>] by cost_usd.
+
+    The drainer reads this field to enforce a per-day cap. We write to
+    SCRIPTS_DIR/state.json (NOT last-flush.json) so the structure aligns
+    with the existing compile-cost tracking already in state.json. Read
+    is JSON; write is whole-file rewrite. Single-writer (the drainer
+    doesn't write; only flush.py does). No concurrent-write risk.
+    """
+    compile_state_file = SCRIPTS_DIR / "state.json"
+    today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    if compile_state_file.exists():
+        try:
+            data = json.loads(compile_state_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    else:
+        data = {}
+    daily = data.setdefault("daily_retry_cost", {})
+    daily[today] = float(daily.get(today, 0.0)) + cost_usd
+    compile_state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def append_to_daily_log(content: str, section: str = "Session") -> None:
     """Append content to today's daily log.
 
@@ -341,6 +364,7 @@ respond with exactly: FLUSH_OK
 
     async def _single_attempt() -> str:
         collected = ""
+        attempt_cost = 0.0
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
@@ -362,7 +386,16 @@ respond with exactly: FLUSH_OK
                     if isinstance(block, TextBlock):
                         collected += block.text
             elif isinstance(message, ResultMessage):
-                pass
+                attempt_cost = message.total_cost_usd or 0.0
+        # T0.D: record per-attempt cost into state.json's daily_retry_cost
+        # dict so the drainer's circuit breaker can throttle when retries
+        # storm the budget. Best-effort — failure to record never blocks
+        # the actual flush result.
+        if attempt_cost > 0.0:
+            try:
+                _record_daily_retry_cost(attempt_cost)
+            except Exception as e:
+                logging.warning("daily_retry_cost write failed: %s", e)
         return collected
 
     # In-process retry budget. attempts 1..MAX_ATTEMPTS.
