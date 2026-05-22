@@ -22,7 +22,14 @@ from config import (
 def _default_state() -> dict:
     """Fresh default state. Always returns a NEW dict (with fresh nested
     containers) so callers can mutate without leaking into later calls."""
-    return {"ingested": {}, "query_count": 0, "last_lint": None, "total_cost": 0.0}
+    return {
+        "ingested": {},
+        "query_count": 0,
+        "last_lint": None,
+        "total_cost": 0.0,
+        "wasted_cost": 0.0,
+        "compile_attempts": {},
+    }
 
 
 # ── State management ──────────────────────────────────────────────────

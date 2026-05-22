@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import sys
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
+from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, SCRIPTS_DIR, now_iso
 from utils import (
     file_hash,
     list_raw_files,
@@ -30,6 +31,83 @@ from utils import (
 
 # ── Paths for the LLM to use ──────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# Quarantine a daily log after this many consecutive failed compile attempts.
+# Manual `--file` invocations bypass the quarantine check.
+MAX_COMPILE_ATTEMPTS = 2
+LOCK_FILE = SCRIPTS_DIR / "compile.lock"
+
+
+def _record_crash(state: dict, rel_path: str, cost: float, error: BaseException) -> None:
+    """Persist a crashed compile attempt.
+
+    Even when the LLM stream crashes after billing, the Anthropic charge is
+    already debited. Capture the actual cost into `state["wasted_cost"]` and
+    bump the per-file retry counter so the quarantine guard can kick in.
+    """
+    print(f"  Error: {error}")
+    if cost > 0:
+        print(
+            f"  WARNING: '{rel_path}' compile crashed AFTER incurring "
+            f"${cost:.4f} in API charges — file remains uncompiled but "
+            "you have been billed."
+        )
+    state["wasted_cost"] = state.get("wasted_cost", 0.0) + cost
+    attempts = state.setdefault("compile_attempts", {})
+    attempts[rel_path] = attempts.get(rel_path, 0) + 1
+    save_state(state)
+
+
+def _record_success(state: dict, log_path: Path, cost: float) -> None:
+    """Persist a successful compile and reset the retry counter."""
+    rel_path = log_path.name
+    state.setdefault("ingested", {})[rel_path] = {
+        "hash": file_hash(log_path),
+        "compiled_at": now_iso(),
+        "cost_usd": cost,
+    }
+    state["total_cost"] = state.get("total_cost", 0.0) + cost
+    attempts = state.setdefault("compile_attempts", {})
+    if rel_path in attempts:
+        attempts[rel_path] = 0
+    save_state(state)
+
+
+def select_files_to_compile(state: dict, all_logs: list[Path]) -> list[Path]:
+    """Decide which daily logs to compile.
+
+    Skips files whose stored hash matches the on-disk hash. Quarantines
+    files that have failed MAX_COMPILE_ATTEMPTS times in a row (loud
+    warning, no API call). Prints a one-line diagnostic whenever a
+    previously-ingested file is re-picked, so future loops can be
+    diagnosed from a single log scan.
+    """
+    to_compile: list[Path] = []
+    ingested = state.get("ingested", {})
+    attempts_map = state.get("compile_attempts", {})
+
+    for log_path in all_logs:
+        rel = log_path.name
+        prev = ingested.get(rel, {})
+        current_hash = file_hash(log_path)
+        if prev and prev.get("hash") == current_hash:
+            continue
+        attempts = attempts_map.get(rel, 0)
+        if attempts >= MAX_COMPILE_ATTEMPTS:
+            print(f"  SKIP (quarantined after {attempts} failed attempts): {rel}")
+            print(
+                f"        Run `uv run python compile.py --file {rel}` "
+                "to retry manually."
+            )
+            continue
+        if prev:
+            print(
+                f"  RECOMPILE {rel}: hash {prev.get('hash')!r} -> "
+                f"{current_hash!r} (last compiled {prev.get('compiled_at')})"
+            )
+        to_compile.append(log_path)
+
+    return to_compile
 
 
 async def compile_daily_log(log_path: Path, state: dict) -> float:
@@ -147,19 +225,10 @@ Read the daily log above and compile it into wiki articles following the schema 
                 cost = message.total_cost_usd or 0.0
                 print(f"  Cost: ${cost:.4f}")
     except Exception as e:
-        print(f"  Error: {e}")
-        return 0.0
+        _record_crash(state, log_path.name, cost, e)
+        return cost
 
-    # Update state
-    rel_path = log_path.name
-    state.setdefault("ingested", {})[rel_path] = {
-        "hash": file_hash(log_path),
-        "compiled_at": now_iso(),
-        "cost_usd": cost,
-    }
-    state["total_cost"] = state.get("total_cost", 0.0) + cost
-    save_state(state)
-
+    _record_success(state, log_path, cost)
     return cost
 
 
@@ -170,7 +239,18 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
     args = parser.parse_args()
 
+    # Single-instance lock: prevents parallel compile.py runs from racing
+    # on state.json (the SessionEnd hook can spawn multiple in parallel).
+    # The kernel releases the lock when the process exits, so no unlock needed.
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another compile.py is already running; exiting.")
+        sys.exit(0)
+
     state = load_state()
+    initial_wasted = state.get("wasted_cost", 0.0)
 
     # Determine which files to compile
     if args.file:
@@ -184,17 +264,10 @@ def main():
             print(f"Error: {args.file} not found")
             sys.exit(1)
         to_compile = [target]
+    elif args.all:
+        to_compile = list_raw_files()
     else:
-        all_logs = list_raw_files()
-        if args.all:
-            to_compile = all_logs
-        else:
-            to_compile = []
-            for log_path in all_logs:
-                rel = log_path.name
-                prev = state.get("ingested", {}).get(rel, {})
-                if not prev or prev.get("hash") != file_hash(log_path):
-                    to_compile.append(log_path)
+        to_compile = select_files_to_compile(state, list_raw_files())
 
     if not to_compile:
         print("Nothing to compile - all daily logs are up to date.")
@@ -213,10 +286,13 @@ def main():
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
         cost = asyncio.run(compile_daily_log(log_path, state))
         total_cost += cost
-        print(f"  Done.")
+        print("  Done.")
 
     articles = list_wiki_articles()
     print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
+    run_wasted = state.get("wasted_cost", 0.0) - initial_wasted
+    if run_wasted > 0:
+        print(f"  ↳ ${run_wasted:.2f} of that was burned on crashed retries.")
     print(f"Knowledge base: {len(articles)} articles")
 
 

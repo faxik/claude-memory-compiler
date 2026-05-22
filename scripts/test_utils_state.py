@@ -52,11 +52,14 @@ class StateResilienceTests(unittest.TestCase):
     def test_load_missing_returns_default(self) -> None:
         state = self.utils.load_state()
         self.assertEqual(state, {"ingested": {}, "query_count": 0,
-                                 "last_lint": None, "total_cost": 0.0})
+                                 "last_lint": None, "total_cost": 0.0,
+                                 "wasted_cost": 0.0, "compile_attempts": {}})
         # Default must be a fresh dict — mutating it must not leak.
         state["ingested"]["x"] = 1
+        state["compile_attempts"]["y"] = 1
         again = self.utils.load_state()
         self.assertEqual(again["ingested"], {})
+        self.assertEqual(again["compile_attempts"], {})
 
     def test_load_empty_file_returns_default(self) -> None:
         self.state_file.write_text("", encoding="utf-8")
